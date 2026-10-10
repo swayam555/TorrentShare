@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.prod
+.env.production
+**/src/server/.env
+
+# Build files
+build/
+dist/
+
+# Logs
+logs/*.log
+*.log
+!logs/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# Torrent data (configurable)
+downloads/
+data/
+
+# Torrent files uploaded by users
+*.torrent
+
+# Compiled files
+*.tsbuildinfo
+exclusive-documentation.md
+
+# Scratch, test, and image files
+test-*.js
+test_*.js
+check_*.js
+fix-*.js
+scratch_*.js
+plan.txt
+repo.txt
+cd
+docker
+desktop.ini
+image*.png
+test-downloads/
