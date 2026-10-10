@@ -1,0 +1,752 @@
+const net = require('net');
+const EventEmitter = require('events');
+const { TimeoutManager, PeerBanManager } = require('./retryManager');
+
+// Error categories
+const ERROR_CATEGORIES = {
+  PROTOCOL_ERROR: 'PROTOCOL_ERROR',
+  HASH_MISMATCH: 'HASH_MISMATCH',
+  TIMEOUT: 'TIMEOUT',
+  CONNECTION_RESET: 'CONNECTION_RESET',
+  HANDSHAKE_FAILED: 'HANDSHAKE_FAILED'
+};
+
+const MESSAGE_TYPES = {
+  CHOKE: 0,
+  UNCHOKE: 1,
+  INTERESTED: 2,
+  NOT_INTERESTED: 3,
+  HAVE: 4,
+  BITFIELD: 5,
+  REQUEST: 6,
+  PIECE: 7,
+  CANCEL: 8,
+  PORT: 9,
+  EXTENDED: 20
+};
+
+/**
+ * Handles individual peer TCP connections and BitTorrent handshake
+ * 
+ * Handshake format (68 bytes):
+ * - 1 byte: pstrlen (19)
+ * - 19 bytes: pstr ("BitTorrent protocol")
+ * - 8 bytes: reserved (zeros)
+ * - 20 bytes: info_hash
+ * - 20 bytes: peer_id
+ * 
+ * Message format (after handshake):
+ * - 4 bytes: length (big endian)
+ * - 1 byte: message id (if length > 0)
+ * - N bytes: payload
+ */
+class PeerConnection extends EventEmitter {
+  /**
+   * @param {Object} options - Connection options
+   * @param {string} options.ip - Peer IP address
+   * @param {number} options.port - Peer port
+   * @param {Buffer} options.infoHash - 20-byte info hash
+   * @param {Buffer} options.peerId - Our 20-byte peer ID
+   * @param {Function} options.onHandshake - Callback when handshake completes
+   * @param {Function} options.onMessage - Callback when message received
+   * @param {Function} options.onError - Callback on error
+   * @param {Function} options.onClose - Callback when connection closes
+   */
+  constructor(options) {
+    super();
+
+    this.ip = options.ip;
+    this.host = options.ip;
+    this.port = options.port;
+    this.infoHash = options.infoHash;
+    this.peerId = options.peerId;
+
+    this.onHandshake = options.onHandshake || (() => {});
+    this.onMessage = options.onMessage || (() => {});
+    this.onError = options.onError || (() => {});
+    this.onClose = options.onClose || (() => {});
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs || 30000;
+
+    // Error handling managers (optional, passed from PeerManager)
+    this.timeoutManager = options.timeoutManager || null;
+    this.banManager = options.banManager || null;
+
+    this.socket = null;
+    this.isConnected = false;
+    this.isHandshakeComplete = false;
+    this.remotePeerId = null;
+    
+    // Error tracking
+    this.errorCount = 0;
+    this.protocolErrors = 0;
+    this.timeoutErrors = 0;
+    this.lastError = null;
+    this._closedIntentionally = false;
+
+    this.handshakeTimeout = null;
+    this.handshakeBuffer = Buffer.alloc(0);
+    this.messageBuffer = Buffer.alloc(0);
+
+    // Peer state
+    this.amChoking = true;
+    this.amInterested = false;
+    this.peerChoking = true;
+    this.peerInterested = false;
+    this.peerBitfield = null;
+    this.peerSupportsExtensions = false;
+
+    if (!Buffer.isBuffer(this.infoHash) || this.infoHash.length !== 20) {
+      throw new Error('infoHash must be a 20-byte Buffer');
+    }
+
+    if (!Buffer.isBuffer(this.peerId) || this.peerId.length !== 20) {
+      throw new Error('peerId must be a 20-byte Buffer');
+    }
+
+    // PeerManager receives structured errors via onError. This listener keeps
+    // EventEmitter's special `error` event from crashing callers that do not
+    // attach their own listener to each individual connection.
+    this.on('error', () => {});
+  }
+
+  /**
+   * Initiates TCP connection and sends handshake
+   * @returns {Promise<void>}
+   */
+  connect() {
+    return new Promise((resolve, reject) => {
+      if (this.isConnected) {
+        return reject(new Error('Already connected'));
+      }
+
+      this._closedIntentionally = false;
+      this.socket = new net.Socket();
+
+      this.handshakeTimeout = setTimeout(() => {
+        this.handleError(new Error('Handshake timeout'));
+        reject(new Error('Handshake timeout'));
+      }, this.handshakeTimeoutMs);
+
+      this.socket.on('connect', () => {
+        this.isConnected = true;
+        this.sendHandshake();
+        resolve();
+      });
+
+      this.socket.on('data', (data) => {
+        this.handleData(data);
+      });
+
+      this.socket.on('error', (error) => {
+        if (this._closedIntentionally) {
+          return;
+        }
+
+        this.handleError(error);
+        if (!this.isConnected) {
+          reject(error);
+        }
+      });
+
+      this.socket.on('close', () => {
+        this.handleClose();
+      });
+
+      this.socket.connect(this.port, this.ip);
+    });
+  }
+
+  /**
+   * Sends BitTorrent handshake to peer
+   */
+  sendHandshake() {
+    const handshake = Buffer.allocUnsafe(68);
+    let offset = 0;
+
+    handshake.writeUInt8(19, offset); offset += 1;
+    handshake.write('BitTorrent protocol', offset, 19, 'utf8'); offset += 19;
+    handshake.fill(0, offset, offset + 8);
+    // BEP 10 extension protocol support. This is harmless for classic peers
+    // and required for BEP 9 magnet metadata exchange.
+    handshake[offset + 5] |= 0x10;
+    offset += 8;
+    this.infoHash.copy(handshake, offset); offset += 20;
+    this.peerId.copy(handshake, offset);
+
+    this.socket.write(handshake);
+  }
+
+  /**
+   * Handles incoming data from peer
+   */
+  handleData(data) {
+    if (!this.isHandshakeComplete) {
+      this.handshakeBuffer = Buffer.concat([this.handshakeBuffer, data]);
+
+      if (this.handshakeBuffer.length >= 68) {
+        this.processHandshake();
+      }
+    } else {
+      this.messageBuffer = Buffer.concat([this.messageBuffer, data]);
+      this.processMessages();
+    }
+  }
+
+  /**
+   * Processes peer wire protocol messages
+   */
+  processMessages() {
+    while (this.messageBuffer.length >= 4) {
+      const length = this.messageBuffer.readUInt32BE(0);
+
+      if (this.messageBuffer.length < 4 + length) {
+        break;
+      }
+
+      const messageBuffer = this.messageBuffer.slice(4, 4 + length);
+      this.messageBuffer = this.messageBuffer.slice(4 + length);
+
+      if (length === 0) {
+        this.handleMessage({ id: null, payload: Buffer.alloc(0) });
+      } else {
+        const id = messageBuffer.readUInt8(0);
+        const payload = messageBuffer.slice(1);
+        this.handleMessage({ id, payload });
+      }
+    }
+  }
+
+  /**
+   * Handles a parsed message
+   */
+  handleMessage(message) {
+    const { id, payload } = message;
+
+    if (id === null) {
+      // Keep-alive
+      return;
+    }
+
+    switch (id) {
+      case MESSAGE_TYPES.CHOKE:
+        this.peerChoking = true;
+        this.onMessage({ type: 'choke' });
+        break;
+
+      case MESSAGE_TYPES.UNCHOKE:
+        this.peerChoking = false;
+        this.onMessage({ type: 'unchoke' });
+        break;
+
+      case MESSAGE_TYPES.INTERESTED:
+        this.peerInterested = true;
+        this.onMessage({ type: 'interested' });
+        break;
+
+      case MESSAGE_TYPES.NOT_INTERESTED:
+        this.peerInterested = false;
+        this.onMessage({ type: 'not_interested' });
+        break;
+
+      case MESSAGE_TYPES.HAVE:
+        if (payload.length === 4) {
+          const pieceIndex = payload.readUInt32BE(0);
+          this.onMessage({ type: 'have', pieceIndex });
+        }
+        break;
+
+      case MESSAGE_TYPES.BITFIELD:
+        this.peerBitfield = payload;
+        this.onMessage({ type: 'bitfield', bitfield: payload });
+        break;
+
+      case MESSAGE_TYPES.REQUEST:
+        if (payload.length === 12) {
+          const index = payload.readUInt32BE(0);
+          const begin = payload.readUInt32BE(4);
+          const length = payload.readUInt32BE(8);
+          this.onMessage({ type: 'request', index, begin, length });
+        }
+        break;
+
+      case MESSAGE_TYPES.PIECE:
+        if (payload.length >= 8) {
+          const index = payload.readUInt32BE(0);
+          const begin = payload.readUInt32BE(4);
+          const data = payload.slice(8);
+          this.onMessage({ type: 'piece', index, begin, data });
+        }
+        break;
+
+      case MESSAGE_TYPES.CANCEL:
+        if (payload.length === 12) {
+          const index = payload.readUInt32BE(0);
+          const begin = payload.readUInt32BE(4);
+          const length = payload.readUInt32BE(8);
+          this.onMessage({ type: 'cancel', index, begin, length });
+        }
+        break;
+
+      case MESSAGE_TYPES.PORT:
+        if (payload.length === 2) {
+          const port = payload.readUInt16BE(0);
+          this.onMessage({ type: 'port', port });
+        }
+        break;
+
+      case MESSAGE_TYPES.EXTENDED:
+        if (payload.length >= 1) {
+          this.onMessage({
+            type: 'extended',
+            extId: payload.readUInt8(0),
+            payload: payload.slice(1)
+          });
+        }
+        break;
+
+      default:
+        break;
+    }
+
+    this.emit('message', { id, payload });
+  }
+
+  /**
+   * Processes and validates peer's handshake
+   */
+  processHandshake() {
+    const handshake = this.handshakeBuffer.slice(0, 68);
+    let offset = 0;
+
+    // Validate pstrlen
+    const pstrlen = handshake.readUInt8(offset); offset += 1;
+    if (pstrlen !== 19) {
+      return this.handleError(new Error(`Invalid pstrlen: expected 19, got ${pstrlen}`));
+    }
+
+    // Validate pstr
+    const pstr = handshake.toString('utf8', offset, offset + 19); offset += 19;
+    if (pstr !== 'BitTorrent protocol') {
+      return this.handleError(new Error(`Invalid protocol string: ${pstr}`));
+    }
+
+    const reserved = handshake.slice(offset, offset + 8);
+    this.peerSupportsExtensions = (reserved[5] & 0x10) !== 0;
+    offset += 8;
+
+    // Validate info_hash
+    const peerInfoHash = handshake.slice(offset, offset + 20); offset += 20;
+    if (!peerInfoHash.equals(this.infoHash)) {
+      return this.handleError(new Error('Info hash mismatch'));
+    }
+
+    // Extract peer_id
+    this.remotePeerId = handshake.slice(offset, offset + 20);
+
+    // Clear handshake timeout
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+
+    this.isHandshakeComplete = true;
+
+    // Capture remaining data before clearing buffer
+    const remaining = this.handshakeBuffer.length > 68
+      ? this.handshakeBuffer.slice(68)
+      : null;
+    this.handshakeBuffer = Buffer.alloc(0);
+
+    // Notify handshake complete FIRST so PeerManager registers this
+    // connection in activeConnections before any messages are dispatched.
+    // Without this ordering, bitfield/unchoke messages that piggyback on
+    // the handshake TCP segment would be emitted before the peer exists
+    // in the connection map, causing requestBlocks() to find zero peers.
+    this.onHandshake({
+      peerId: this.remotePeerId,
+      ip: this.ip,
+      port: this.port,
+      supportsExtensions: this.peerSupportsExtensions
+    });
+
+    this.emit('handshake', {
+      peerId: this.remotePeerId,
+      ip: this.ip,
+      port: this.port,
+      supportsExtensions: this.peerSupportsExtensions
+    });
+
+    // NOW process any remaining data (bitfield, unchoke, etc.)
+    if (remaining) {
+      this.handleData(remaining);
+    }
+  }
+
+  /**
+   * Sends a peer wire protocol message
+   * @param {number} id - Message ID
+   * @param {Buffer} payload - Message payload
+   */
+  sendMessage(id, payload = Buffer.alloc(0)) {
+    if (!this.isConnected || !this.isHandshakeComplete) {
+      throw new Error('Cannot send message: not connected or handshake not complete');
+    }
+
+    const length = 1 + payload.length;
+    const message = Buffer.allocUnsafe(4 + length);
+    
+    message.writeUInt32BE(length, 0);
+    message.writeUInt8(id, 4);
+    if (payload.length > 0) {
+      payload.copy(message, 5);
+    }
+
+    this.socket.write(message);
+  }
+
+  /**
+   * Writes a raw wire-protocol packet to the peer.
+   * Used by extension protocol helpers that already frame messages.
+   * @param {Buffer} packet
+   */
+  write(packet) {
+    if (!this.socket || !this.isConnected || !this.isHandshakeComplete) {
+      throw new Error('Cannot write packet: not connected or handshake not complete');
+    }
+
+    this.socket.write(packet);
+  }
+
+  /**
+   * Sends keep-alive message
+   */
+  sendKeepAlive() {
+    if (!this.isConnected || !this.isHandshakeComplete) {
+      throw new Error('Cannot send message: not connected or handshake not complete');
+    }
+
+    const message = Buffer.allocUnsafe(4);
+    message.writeUInt32BE(0, 0);
+    this.socket.write(message);
+  }
+
+  /**
+   * Sends choke message
+   */
+  sendChoke() {
+    this.sendMessage(MESSAGE_TYPES.CHOKE);
+    this.amChoking = true;
+  }
+
+  /**
+   * Sends unchoke message
+   */
+  sendUnchoke() {
+    this.sendMessage(MESSAGE_TYPES.UNCHOKE);
+    this.amChoking = false;
+  }
+
+  /**
+   * Sends interested message
+   */
+  sendInterested() {
+    this.sendMessage(MESSAGE_TYPES.INTERESTED);
+    this.amInterested = true;
+  }
+
+  /**
+   * Sends not interested message
+   */
+  sendNotInterested() {
+    this.sendMessage(MESSAGE_TYPES.NOT_INTERESTED);
+    this.amInterested = false;
+  }
+
+  /**
+   * Sends have message
+   * @param {number} pieceIndex - Index of piece we have
+   */
+  sendHave(pieceIndex) {
+    const payload = Buffer.allocUnsafe(4);
+    payload.writeUInt32BE(pieceIndex, 0);
+    this.sendMessage(MESSAGE_TYPES.HAVE, payload);
+  }
+
+  /**
+   * Sends bitfield message
+   * @param {Buffer} bitfield - Bitfield of pieces we have
+   */
+  sendBitfield(bitfield) {
+    this.sendMessage(MESSAGE_TYPES.BITFIELD, bitfield);
+  }
+
+  /**
+   * Sends request message
+   * @param {number} index - Piece index
+   * @param {number} begin - Byte offset within piece
+   * @param {number} length - Length of block to request
+   */
+  sendRequest(index, begin, length) {
+    const payload = Buffer.allocUnsafe(12);
+    payload.writeUInt32BE(index, 0);
+    payload.writeUInt32BE(begin, 4);
+    payload.writeUInt32BE(length, 8);
+    this.sendMessage(MESSAGE_TYPES.REQUEST, payload);
+  }
+
+  /**
+   * Sends piece message
+   * @param {number} index - Piece index
+   * @param {number} begin - Byte offset within piece
+   * @param {Buffer} data - Block data
+   */
+  sendPiece(index, begin, data) {
+    const payload = Buffer.allocUnsafe(8 + data.length);
+    payload.writeUInt32BE(index, 0);
+    payload.writeUInt32BE(begin, 4);
+    data.copy(payload, 8);
+    this.sendMessage(MESSAGE_TYPES.PIECE, payload);
+  }
+
+  /**
+   * Sends cancel message
+   * @param {number} index - Piece index
+   * @param {number} begin - Byte offset within piece
+   * @param {number} length - Length of block to cancel
+   */
+  sendCancel(index, begin, length) {
+    const payload = Buffer.allocUnsafe(12);
+    payload.writeUInt32BE(index, 0);
+    payload.writeUInt32BE(begin, 4);
+    payload.writeUInt32BE(length, 8);
+    this.sendMessage(MESSAGE_TYPES.CANCEL, payload);
+  }
+
+  /**
+   * Closes the connection gracefully
+   */
+  disconnect() {
+    this._closedIntentionally = true;
+
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+
+    if (this.socket) {
+      this.socket.destroy();
+    }
+
+    this.isConnected = false;
+    this.isHandshakeComplete = false;
+  }
+
+  /**
+   * Handles connection errors with categorization
+   */
+  handleError(error, category = null) {
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+    
+    // Categorize error if not provided
+    if (!category) {
+      category = this._categorizeError(error);
+    }
+    
+    // Track error
+    this.errorCount++;
+    this.lastError = { error, category, timestamp: Date.now() };
+    
+    // Update category-specific counters
+    if (category === ERROR_CATEGORIES.PROTOCOL_ERROR) {
+      this.protocolErrors++;
+    } else if (category === ERROR_CATEGORIES.TIMEOUT) {
+      this.timeoutErrors++;
+    }
+    
+    // Create structured error event
+    const errorEvent = {
+      category,
+      code: this._getErrorCode(category, error),
+      message: error.message,
+      details: {
+        ip: this.ip,
+        port: this.port,
+        remotePeerId: this.remotePeerId,
+        handshakeComplete: this.isHandshakeComplete,
+        errorCount: this.errorCount
+      },
+      recoverable: this._isRecoverable(category),
+      action: this._getErrorAction(category)
+    };
+    
+    // Handle based on category
+    this._handleErrorByCategory(category, error, errorEvent);
+    
+    this.onError(errorEvent);
+    this.emit('error', errorEvent);
+  }
+  
+  /**
+   * Categorizes error type
+   * @private
+   */
+  _categorizeError(error) {
+    const msg = error.message.toLowerCase();
+    
+    if (msg.includes('timeout')) {
+      return ERROR_CATEGORIES.TIMEOUT;
+    } else if (msg.includes('protocol') || msg.includes('invalid') || msg.includes('pstrlen')) {
+      return ERROR_CATEGORIES.PROTOCOL_ERROR;
+    } else if (msg.includes('info hash') || msg.includes('hash mismatch')) {
+      return ERROR_CATEGORIES.HANDSHAKE_FAILED;
+    } else if (msg.includes('reset') || msg.includes('econnreset') || msg.includes('epipe')) {
+      return ERROR_CATEGORIES.CONNECTION_RESET;
+    }
+    
+    // Default to connection reset
+    return ERROR_CATEGORIES.CONNECTION_RESET;
+  }
+  
+  /**
+   * Gets error code
+   * @private
+   */
+  _getErrorCode(category, error) {
+    const codes = {
+      [ERROR_CATEGORIES.PROTOCOL_ERROR]: 'PROTOCOL_ERROR',
+      [ERROR_CATEGORIES.HASH_MISMATCH]: 'HASH_MISMATCH',
+      [ERROR_CATEGORIES.TIMEOUT]: 'TIMEOUT',
+      [ERROR_CATEGORIES.CONNECTION_RESET]: 'CONNECTION_RESET',
+      [ERROR_CATEGORIES.HANDSHAKE_FAILED]: 'HANDSHAKE_FAILED'
+    };
+    
+    return codes[category] || 'UNKNOWN_ERROR';
+  }
+  
+  /**
+   * Determines if error is recoverable
+   * @private
+   */
+  _isRecoverable(category) {
+    return category === ERROR_CATEGORIES.CONNECTION_RESET || 
+           category === ERROR_CATEGORIES.TIMEOUT;
+  }
+  
+  /**
+   * Determines action for error
+   * @private
+   */
+  _getErrorAction(category) {
+    switch (category) {
+      case ERROR_CATEGORIES.PROTOCOL_ERROR:
+        return 'skip'; // Strike peer and disconnect
+      case ERROR_CATEGORIES.HASH_MISMATCH:
+        return 'retry'; // Re-request from others
+      case ERROR_CATEGORIES.TIMEOUT:
+        return this.timeoutErrors > 3 ? 'skip' : 'retry';
+      case ERROR_CATEGORIES.CONNECTION_RESET:
+        return 'retry'; // Reconnect with backoff
+      case ERROR_CATEGORIES.HANDSHAKE_FAILED:
+        return 'skip'; // Ban if repeated
+      default:
+        return 'skip';
+    }
+  }
+  
+  /**
+   * Handles error based on category
+   * @private
+   */
+  _handleErrorByCategory(category, error, errorEvent) {
+    const peerId = this.remotePeerId ? this.remotePeerId.toString('hex') : `${this.ip}:${this.port}`;
+    
+    switch (category) {
+      case ERROR_CATEGORIES.PROTOCOL_ERROR:
+        console.warn(`[PeerConnection] Protocol error from ${peerId}: ${error.message}`);
+        // Strike peer if ban manager available
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'protocol_error');
+        }
+        this.disconnect();
+        break;
+        
+      case ERROR_CATEGORIES.HASH_MISMATCH:
+        console.warn(`[PeerConnection] Hash mismatch from ${peerId}`);
+        // Strike peer
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'invalid_piece');
+        }
+        // Don't disconnect immediately - might be one bad piece
+        break;
+        
+      case ERROR_CATEGORIES.TIMEOUT:
+        console.warn(`[PeerConnection] Timeout from ${peerId} (${this.timeoutErrors} total)`);
+        // Track timeout
+        if (this.banManager && this.timeoutErrors > 3) {
+          this.banManager.strike(peerId, 'timeout');
+        }
+        if (this.timeoutErrors > 5) {
+          this.disconnect();
+        }
+        break;
+        
+      case ERROR_CATEGORIES.CONNECTION_RESET:
+        console.log(`[PeerConnection] Connection reset from ${peerId}`);
+        // Will be handled by reconnection logic in PeerManager
+        this.disconnect();
+        break;
+        
+      case ERROR_CATEGORIES.HANDSHAKE_FAILED:
+        console.warn(`[PeerConnection] Handshake failed with ${peerId}: ${error.message}`);
+        // Ban if repeated handshake failures
+        if (this.banManager) {
+          this.banManager.strike(peerId, 'protocol_error');
+        }
+        this.disconnect();
+        break;
+    }
+  }
+  
+  /**
+   * Reports hash mismatch for a piece
+   */
+  reportHashMismatch(pieceIndex) {
+    const error = new Error(`Piece ${pieceIndex} hash mismatch`);
+    this.handleError(error, ERROR_CATEGORIES.HASH_MISMATCH);
+  }
+
+  /**
+   * Handles connection errors
+   */
+  handleError_OLD(error) {
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+
+    this.onError(error);
+    this.emit('error', error);
+    this.disconnect();
+  }
+
+  /**
+   * Handles connection close
+   */
+  handleClose() {
+    if (this.handshakeTimeout) {
+      clearTimeout(this.handshakeTimeout);
+      this.handshakeTimeout = null;
+    }
+
+    this.isConnected = false;
+    this.isHandshakeComplete = false;
+    
+    this.onClose();
+    this.emit('close');
+  }
+}
+
+module.exports = { PeerConnection, MESSAGE_TYPES, ERROR_CATEGORIES };

@@ -1,0 +1,101 @@
+const { User } = require('../models/sql');
+
+// Function to get user profile (excludes password)
+exports.getUserProfile = async (req, res) => {
+    try {
+        const user = await User.findByPk(req.user.userId || req.user.id, { attributes: { exclude: ['password'] } });
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        res.json({ ...user.toJSON(), _id: user.id });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error: ' + error.message });
+    }
+};
+
+// Function to get user audit history
+exports.getUserHistory = async (req, res) => {
+    try {
+        const { ArtifactActivity, Transfer } = require('../models/sql');
+        const { Op } = require('sequelize');
+        const userId = req.user.userId || req.user.id;
+        
+        // Find all info_hashes owned by the user
+        const userTorrents = await Transfer.findAll({ 
+            where: { uploaded_by: userId }, 
+            attributes: ['info_hash'] 
+        });
+        const userHashes = userTorrents.map(t => t.info_hash);
+
+        const history = await ArtifactActivity.findAll({
+            where: {
+                [Op.or]: [
+                    { user_id: userId },
+                    { info_hash: { [Op.in]: userHashes } }
+                ]
+            },
+            order: [['created_at', 'DESC']],
+            limit: 100
+        });
+        res.json(history);
+    } catch (error) {
+        res.status(500).json({ message: 'Server error: ' + error.message });
+    }
+};
+
+// Function to update user profile (restricted fields)
+exports.updateUserProfile = async (req, res) => {
+    try {
+        // Only allow updating specific fields (not password, role, etc.)
+        const allowedUpdates = ['username', 'email'];
+        const updates = {};
+        
+        for (const key of allowedUpdates) {
+            if (req.body[key] !== undefined) {
+                updates[key] = req.body[key];
+            }
+        }
+
+        await User.update(updates, { where: { id: req.user.userId || req.user.id } });
+        const user = await User.findByPk(req.user.userId || req.user.id, { attributes: { exclude: ['password'] } });
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        res.json({ ...user.toJSON(), _id: user.id });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error: ' + error.message });
+    }
+};
+
+// Function to change password (separate endpoint)
+exports.changePassword = async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ message: 'Current and new password are required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ message: 'New password must be at least 6 characters' });
+        }
+
+        const user = await User.findByPk(req.user.userId || req.user.id);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const isMatch = await user.comparePassword(currentPassword);
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Current password is incorrect' });
+        }
+
+        user.password = newPassword; // Will be hashed by beforeSave hook
+        await user.save();
+
+        res.json({ message: 'Password changed successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error: ' + error.message });
+    }
+};
