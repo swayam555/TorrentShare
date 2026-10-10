@@ -1,0 +1,247 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.2.0
+    ports:
+      - "3032:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - kafka-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  kafka:
+    image: confluentinc/cp-kafka:7.2.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "3031:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_BROKER_ID: 1
+    networks:
+      - kafka-network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./src/server
+      dockerfile: Dockerfile
+    command: sh -c "npm install && npm run start"
+    ports:
+      - "3029:3029"
+    env_file:
+      - .env
+    environment:
+      - PORT=3029
+      - KAFKA_ENABLED=true
+      - KAFKA_BROKERS=kafka:9092
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=torrentedge
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - REDIS_URL=redis://redis:6379
+      - S3_ENDPOINT=http://minio:9000
+      - OTEL_ENABLED=true
+      - OTEL_SERVICE_NAME=torrentedge-backend
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - app-network
+      - kafka-network
+    volumes:
+      - ./src/server:/usr/src/app
+      - /usr/src/app/node_modules
+      - torrent-downloads:/usr/src/app/downloads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3029/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - app-network
+      - kafka-network
+
+
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: torrentedge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: torrentedge
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: torrentedge-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: torrentedge-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: torrentedge-grafana
+    ports:
+      - "3033:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+    networks:
+      - app-network
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: torrentedge-tempo
+    command:
+      - "-config.file=/etc/tempo.yml"
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./observability/tempo/tempo.yml:/etc/tempo.yml:ro
+      - tempo-data:/tmp/tempo
+    networks:
+      - app-network
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: torrentedge-otel-collector
+    command:
+      - "--config=/etc/otelcol/config.yml"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8888:8888"
+    volumes:
+      - ./observability/otel-collector/config.yml:/etc/otelcol/config.yml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+    networks:
+      - app-network
+
+  minio:
+    image: minio/minio:RELEASE.2023-11-20T22-40-07Z
+    container_name: torrentedge-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    volumes:
+      - minio-data:/data
+    networks:
+      - app-network
+
+  createbuckets:
+    image: minio/mc:RELEASE.2023-11-20T16-30-59Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      sleep 5;
+      /usr/bin/mc config host add myminio http://minio:9000 admin password;
+      /usr/bin/mc mb myminio/torrentedge-artifacts --ignore-existing;
+      /usr/bin/mc anonymous set public myminio/torrentedge-artifacts;
+      exit 0;
+      "
+    networks:
+      - app-network
+
+networks:
+  kafka-network:
+    driver: bridge
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  torrent-downloads:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  tempo-data:
+    driver: local
+  minio-data:
+    driver: local
